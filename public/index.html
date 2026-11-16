@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Google Drive Auto Subtitles</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; padding: 30px; display: flex; justify-content: center; }
+    .container { width: 100%; max-width: 900px; }
+    h1 { font-size: 24px; margin-bottom: 20px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+    .card { background: #1e293b; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+    label { display: block; font-weight: 600; margin-bottom: 8px; color: #cbd5e1; }
+    textarea { width: 100%; height: 110px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #f8fafc; padding: 12px; font-size: 14px; outline: none; }
+    textarea:focus { border-color: #38bdf8; }
+    .form-row { display: flex; gap: 20px; margin-top: 15px; align-items: flex-end; flex-wrap: wrap; }
+    select { background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 10px 14px; border-radius: 8px; outline: none; }
+    button { background: #0284c7; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; font-size: 15px; }
+    button:hover { background: #0369a1; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    button.login-btn { background: #334155; color: #e2e8f0; }
+    button.login-btn:hover { background: #475569; }
+    .terminal { background: #000; border: 1px solid #334155; border-radius: 8px; padding: 16px; height: 350px; overflow-y: auto; font-family: "Courier New", Courier, monospace; font-size: 13px; line-height: 1.5; color: #4ade80; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 Tự Động Gắn Phụ Đề Google Drive</h1>
+    
+    <div class="card">
+      <label for="folderIds">Danh sách ID thư mục (Mỗi ID hoặc Link trên 1 dòng):</label>
+      <textarea id="folderIds" placeholder="Ví dụ:&#10;1EJbPwPHrovXUjCnEjXd6O2ykXVvDWeJP&#10;https://drive.google.com/drive/folders/1PtPGpoq7..."></textarea>
+      
+      <div class="form-row">
+        <div>
+          <label style="margin-bottom: 4px;">Số luồng chạy song song:</label>
+          <select id="concurrency">
+            <option value="1">1 luồng (Tuần tự)</option>
+            <option value="2" selected>2 luồng song song (Khuyên dùng)</option>
+            <option value="3">3 luồng song song</option>
+          </select>
+        </div>
+        
+        <div>
+          <button id="runBtn" onclick="startTask()">🚀 Bắt đầu chạy (Run)</button>
+        </div>
+
+        <div>
+          <button class="login-btn" onclick="openLogin()">🔑 Đăng nhập Google (Lần đầu)</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Màn hình tiến trình (Live Logs):</label>
+      <div class="terminal" id="terminal">Đang chờ lệnh chạy...</div>
+    </div>
+  </div>
+
+  <script>
+    const term = document.getElementById('terminal');
+    const btn = document.getElementById('runBtn');
+
+    const evtSource = new EventSource('/api/logs');
+    evtSource.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      term.innerText += '\n' + msg;
+      term.scrollTop = term.scrollHeight;
+      if (msg.includes('ĐÃ HOÀN TẤT TẤT CẢ CÁC THƯ MỤC') || msg.includes('Có lỗi')) {
+        btn.disabled = false;
+        btn.innerText = '🚀 Bắt đầu chạy (Run)';
+      }
+    };
+
+    async function openLogin() {
+      term.innerText = '🔑 Đang mở trình duyệt Chrome để bạn đăng nhập tài khoản...';
+      await fetch('/api/login', { method: 'POST' });
+    }
+
+    async function startTask() {
+      const raw = document.getElementById('folderIds').value.trim();
+      if (!raw) return alert('Vui lòng nhập ít nhất 1 ID hoặc Link thư mục!');
+
+      const folderUrls = raw.split('\n').map(s => s.trim()).filter(Boolean);
+      const concurrency = parseInt(document.getElementById('concurrency').value);
+
+      btn.disabled = true;
+      btn.innerText = '⏳ Đang xử lý...';
+      term.innerText = '🚀 Đang khởi động trình duyệt...';
+
+      await fetch('/api/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folderUrls, concurrency })
+      });
+    }
+  </script>
+</body>
+</html>
