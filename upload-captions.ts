@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { chromium, Page } from 'playwright';
+import { chromium, FrameLocator, Locator, Page } from 'playwright';
 import * as path from 'path';
 
 function getFolderUrlsFromEnv(): string[] {
@@ -28,6 +28,117 @@ interface SubtitleInfo {
   fileName: string;
   langText: 'Tiếng Anh' | 'Tiếng Việt';
   title: string;
+}
+
+async function getRowName(row: Locator): Promise<string> {
+  const strong = row.locator('strong').first();
+  if (await strong.count()) return (await strong.innerText()).trim();
+  return (await row.innerText()).split('\n')[0].trim();
+}
+
+/** Scroll the Drive picker viewport in steps so lazy-loaded rows are rendered. */
+async function findFileInPicker(pickerFrame: FrameLocator, fileName: string) {
+  const item = () => pickerFrame.locator('[role="option"], [role="gridcell"]').filter({
+    has: pickerFrame.getByText(fileName, { exact: true })
+  }).first();
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const match = item();
+    if (await match.count()) return match;
+
+    // Drive's picker uses an inner scrolling pane. Advance every scrollable
+    // pane a viewport at a time; this also triggers its lazy loading.
+    await pickerFrame.locator('body').evaluate((body: HTMLElement) => {
+      const panes = [body, ...Array.from(body.querySelectorAll<HTMLElement>('*'))]
+        .filter(el => el.scrollHeight > el.clientHeight + 20 && el.clientHeight > 0);
+      for (const pane of panes) pane.scrollTop = Math.min(pane.scrollTop + Math.max(pane.clientHeight * 0.8, 300), pane.scrollHeight);
+    });
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  return item();
+}
+
+/** Scroll a Drive list to its end while collecting names from each lazy-loaded batch. */
+async function collectRowsWhileScrolling(page: Page, selector: string): Promise<string[]> {
+  const names = new Set<string>();
+  let stableAtEnd = 0;
+  let previousSignature = '';
+
+  for (let attempt = 0; attempt < 120 && stableAtEnd < 3; attempt++) {
+    const rows = page.locator(selector);
+    const count = await rows.count();
+    for (let i = 0; i < count; i++) {
+      const name = await getRowName(rows.nth(i));
+      if (name) names.add(name);
+    }
+
+    const metrics = await page.locator('body').evaluate((body: HTMLElement) => {
+      const rowNodes = Array.from(body.querySelectorAll<HTMLElement>('[role="row"]'));
+      const candidates = new Set<HTMLElement>();
+      for (const row of rowNodes) {
+        let parent = row.parentElement;
+        while (parent && parent !== body) {
+          if (parent.scrollHeight > parent.clientHeight + 20 && parent.clientHeight > 0) candidates.add(parent);
+          parent = parent.parentElement;
+        }
+      }
+      const panes = [...candidates].sort((a, b) => {
+        const rowDiff = b.querySelectorAll('[role="row"]').length - a.querySelectorAll('[role="row"]').length;
+        return rowDiff || b.clientHeight - a.clientHeight;
+      });
+      const pane = panes[0] ?? document.scrollingElement as HTMLElement | null;
+      if (!pane) return { top: 0, height: 0, client: 0 };
+      pane.scrollTop = Math.min(pane.scrollTop + Math.max(pane.clientHeight * 0.8, 400), pane.scrollHeight);
+      return { top: pane.scrollTop, height: pane.scrollHeight, client: pane.clientHeight };
+    });
+    await page.waitForTimeout(600);
+
+    const signature = `${names.size}:${metrics.height}:${metrics.top}`;
+    const atEnd = metrics.top + metrics.client >= metrics.height - 10;
+    stableAtEnd = atEnd && signature === previousSignature ? stableAtEnd + 1 : 0;
+    previousSignature = signature;
+  }
+
+  if (names.size === 0) throw new Error('Không đọc được tên file trong danh sách Drive.');
+  return [...names];
+}
+
+async function findRowByNameWhileScrolling(page: Page, name: string) {
+  const row = () => page.locator('[role="row"]').filter({ has: page.getByText(name, { exact: true }) }).first();
+  await page.locator('body').evaluate((body: HTMLElement) => {
+    const panes = new Set<HTMLElement>();
+    for (const row of Array.from(body.querySelectorAll<HTMLElement>('[role="row"]'))) {
+      let parent = row.parentElement;
+      while (parent && parent !== body) {
+        if (parent.scrollHeight > parent.clientHeight + 20 && parent.clientHeight > 0) panes.add(parent);
+        parent = parent.parentElement;
+      }
+    }
+    const pane = [...panes].sort((a, b) => b.querySelectorAll('[role="row"]').length - a.querySelectorAll('[role="row"]').length || b.clientHeight - a.clientHeight)[0] ?? document.scrollingElement as HTMLElement | null;
+    if (pane) pane.scrollTop = 0;
+  });
+
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const match = row();
+    if (await match.count()) {
+      await match.scrollIntoViewIfNeeded();
+      return match;
+    }
+    await page.locator('body').evaluate((body: HTMLElement) => {
+      const panes = new Set<HTMLElement>();
+      for (const row of Array.from(body.querySelectorAll<HTMLElement>('[role="row"]'))) {
+        let parent = row.parentElement;
+        while (parent && parent !== body) {
+          if (parent.scrollHeight > parent.clientHeight + 20 && parent.clientHeight > 0) panes.add(parent);
+          parent = parent.parentElement;
+        }
+      }
+      const pane = [...panes].sort((a, b) => b.querySelectorAll('[role="row"]').length - a.querySelectorAll('[role="row"]').length || b.clientHeight - a.clientHeight)[0] ?? document.scrollingElement as HTMLElement | null;
+      if (pane) pane.scrollTop = Math.min(pane.scrollTop + Math.max(pane.clientHeight * 0.8, 400), pane.scrollHeight);
+    });
+    await page.waitForTimeout(300);
+  }
+  throw new Error('Không tìm thấy hàng "' + name + '" sau khi cuộn hết danh sách.');
 }
 
 /**
@@ -91,11 +202,8 @@ async function attachSingleSubtitle(targetPage: Page, sub: SubtitleInfo, folderU
   console.log(`         👉 Tìm chính xác file "${sub.fileName}"...`);
   
   // Lọc thẻ card có chứa đúng 100% tên file
-  const srtItem = pickerFrame.locator('[role="option"], [role="gridcell"]').filter({
-    has: pickerFrame.getByText(sub.fileName, { exact: true })
-  }).first();
-
-  await srtItem.waitFor({ state: 'attached', timeout: 10000 });
+  const srtItem = await findFileInPicker(pickerFrame, sub.fileName);
+  await srtItem.waitFor({ state: 'attached', timeout: 3000 });
   await srtItem.scrollIntoViewIfNeeded(); // Tự động cuộn xuống nếu nằm ở hàng dưới
   await targetPage.waitForTimeout(400);
 
@@ -138,11 +246,11 @@ async function attachSingleSubtitle(targetPage: Page, sub: SubtitleInfo, folderU
  * Xử lý 1 video
  */
 async function processVideo(page: Page, videoRow: any, allSrtFiles: string[], folderUrl: string, folderName: string) {
-  const videoFullName = (await videoRow.locator('strong').first().innerText()).trim();
+  const videoFullName = await getRowName(videoRow);
 
-  // Bỏ qua file có tiền tố "_"
-  if (videoFullName.startsWith('_')) {
-    console.log(`⏩ [BỎ QUA] "${videoFullName}" (bắt đầu bằng _)`);
+  // Bỏ qua file có tiền tố "_" hoặc "._"
+  if (videoFullName.startsWith('_') || videoFullName.startsWith('._')) {
+    console.log(`⏩ [BỎ QUA] "${videoFullName}" (bắt đầu bằng _ hoặc ._)`);
     return;
   }
 
@@ -222,23 +330,19 @@ async function processFolder(page: Page, folderUrl: string, folderName: string) 
   await page.goto(folderUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(3500);
 
-  const srtElements = page.locator('tr[role="row"]:has-text(".srt") strong');
-  const srtCount = await srtElements.count();
-  const allSrtFiles: string[] = [];
-  for (let i = 0; i < srtCount; i++) {
-    allSrtFiles.push((await srtElements.nth(i).innerText()).trim());
-  }
-
-  const videoRows = page.locator('tr[role="row"]:has-text(".mp4")');
-  const videoCount = await videoRows.count();
-  console.log(`🔎 [${folderName}] Có ${videoCount} video .mp4 và ${srtCount} file phụ đề.`);
+  const allNames = await collectRowsWhileScrolling(page, '[role="row"]');
+  const allSrtFiles = allNames.filter(name => /\.srt$/i.test(name));
+  const videoNames = allNames.filter(name => /\.mp4$/i.test(name));
+  const videoCount = videoNames.length;
+  console.log(`🔎 [${folderName}] Có ${videoCount} video .mp4 và ${allSrtFiles.length} file phụ đề.`);
 
   for (let i = 0; i < videoCount; i++) {
-    const row = videoRows.nth(i);
+    const videoName = videoNames[i];
     try {
+      const row = await findRowByNameWhileScrolling(page, videoName);
       await processVideo(page, row, allSrtFiles, folderUrl, folderName);
     } catch (err) {
-      console.error(`❌ [${folderName}] Lỗi video thứ ${i + 1}:`, err);
+      console.error(`❌ [${folderName}] Lỗi video "${videoName}" (thứ ${i + 1}):`, err);
       await page.keyboard.press('Escape');
     }
   }
@@ -257,16 +361,22 @@ async function discoverTargetFolders(page: Page, rootUrls: string[]): Promise<{ 
     await page.goto(rootUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(3500);
 
-    let folderRows = page.locator('tr[role="row"][data-target="folder"]');
+    let folderRows = page.locator('[role="row"][data-target="folder"]');
     if ((await folderRows.count()) === 0) {
-      folderRows = page.locator('tr[role="row"]').filter({ hasText: '—' });
+      folderRows = page.locator('[role="row"]').filter({ hasText: '—' });
+    }
+
+    await collectRowsWhileScrolling(page, '[role="row"]');
+    folderRows = page.locator('[role="row"][data-target="folder"]');
+    if ((await folderRows.count()) === 0) {
+      folderRows = page.locator('[role="row"]').filter({ hasText: '—' });
     }
 
     const subCount = await folderRows.count();
     if (subCount > 0) {
       for (let i = 0; i < subCount; i++) {
         const row = folderRows.nth(i);
-        const name = (await row.locator('strong').first().innerText()).trim();
+        const name = await getRowName(row);
         const id = await row.getAttribute('data-id');
         if (id) {
           result.push({ name, url: `https://drive.google.com/drive/folders/${id}` });
